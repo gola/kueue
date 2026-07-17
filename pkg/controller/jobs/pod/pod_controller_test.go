@@ -7107,3 +7107,137 @@ func TestStop(t *testing.T) {
 		})
 	}
 }
+
+func TestStopGatedPodGroup(t *testing.T) {
+	now := time.Now()
+	fakeClock := testingclock.NewFakeClock(now)
+
+	// Build a gated pod group with 2 pods, both gated and with finalizers
+	gatedPod1 := testingpod.MakePod("gated-pod-1", metav1.NamespaceDefault).
+		GroupNameLabel("test-group").
+		KueueSchedulingGate().
+		KueueFinalizer().
+		ResourceVersion("1").
+		Obj()
+	gatedPod2 := testingpod.MakePod("gated-pod-2", metav1.NamespaceDefault).
+		GroupNameLabel("test-group").
+		KueueSchedulingGate().
+		KueueFinalizer().
+		ResourceVersion("1").
+		Obj()
+
+	// Build a non-gated pod group with 2 pods, neither gated
+	runningPod1 := testingpod.MakePod("running-pod-1", metav1.NamespaceDefault).
+		GroupNameLabel("test-group").
+		KueueFinalizer().
+		ResourceVersion("1").
+		Obj()
+	runningPod2 := testingpod.MakePod("running-pod-2", metav1.NamespaceDefault).
+		GroupNameLabel("test-group").
+		KueueFinalizer().
+		ResourceVersion("1").
+		Obj()
+
+	// Build a gated pod group with keep-gated-while-queued annotation
+	keepGatedPod1 := testingpod.MakePod("keep-gated-pod-1", metav1.NamespaceDefault).
+		GroupNameLabel("test-group").
+		KueueSchedulingGate().
+		KueueFinalizer().
+		Annotation(podconstants.GroupKeepGatedWhileQueuedAnnotationKey, podconstants.GroupKeepGatedWhileQueuedAnnotationValue).
+		ResourceVersion("1").
+		Obj()
+	keepGatedPod2 := testingpod.MakePod("keep-gated-pod-2", metav1.NamespaceDefault).
+		GroupNameLabel("test-group").
+		KueueSchedulingGate().
+		KueueFinalizer().
+		Annotation(podconstants.GroupKeepGatedWhileQueuedAnnotationKey, podconstants.GroupKeepGatedWhileQueuedAnnotationValue).
+		ResourceVersion("1").
+		Obj()
+
+	testCases := map[string]struct {
+		pods        []corev1.Pod
+		stopReason  jobframework.StopReason
+		wantDeleted bool
+	}{
+		"gated pod group stopped with NotAdmitted should delete gated pods": {
+			pods:        []corev1.Pod{*gatedPod1, *gatedPod2},
+			stopReason:  jobframework.StopReasonNotAdmitted,
+			wantDeleted: true,
+		},
+		"gated pod group stopped with WorkloadDeleted should delete gated pods": {
+			pods:        []corev1.Pod{*gatedPod1, *gatedPod2},
+			stopReason:  jobframework.StopReasonWorkloadDeleted,
+			wantDeleted: true,
+		},
+		"gated pod group stopped with WorkloadEvicted should NOT delete gated pods": {
+			pods:        []corev1.Pod{*gatedPod1, *gatedPod2},
+			stopReason:  jobframework.StopReasonWorkloadEvicted,
+			wantDeleted: false,
+		},
+		"non-gated pod group stopped with NotAdmitted should delete running pods": {
+			pods:        []corev1.Pod{*runningPod1, *runningPod2},
+			stopReason:  jobframework.StopReasonNotAdmitted,
+			wantDeleted: true,
+		},
+		"keep-gated-while-queued pod group stopped with NotAdmitted should NOT delete gated pods": {
+			pods:        []corev1.Pod{*keepGatedPod1, *keepGatedPod2},
+			stopReason:  jobframework.StopReasonNotAdmitted,
+			wantDeleted: false,
+		},
+		"keep-gated-while-queued pod group stopped with WorkloadDeleted should delete gated pods": {
+			pods:        []corev1.Pod{*keepGatedPod1, *keepGatedPod2},
+			stopReason:  jobframework.StopReasonWorkloadDeleted,
+			wantDeleted: true,
+		},
+		"keep-gated-while-queued pod group stopped with WorkloadEvicted should NOT delete gated pods": {
+			pods:        []corev1.Pod{*keepGatedPod1, *keepGatedPod2},
+			stopReason:  jobframework.StopReasonWorkloadEvicted,
+			wantDeleted: false,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx, _ := utiltesting.ContextWithLog(t)
+
+			var deleted bool
+
+			kcBuilder := utiltesting.NewClientBuilder().
+				WithObjects(utilpodListToObjects(tc.pods)...).
+				WithIndex(&corev1.Pod{}, PodGroupNameCacheKey, IndexPodGroupName).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						deleted = true
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+			kClient := kcBuilder.Build()
+
+			p := Pod{
+				pod:     tc.pods[0],
+				isGroup: true,
+				list: corev1.PodList{
+					Items: tc.pods,
+				},
+				clock: fakeClock,
+			}
+
+			_, err := p.Stop(ctx, kClient, nil, tc.stopReason, "Test message")
+			if err != nil {
+				t.Fatalf("Unexpected error from Stop: %v", err)
+			}
+
+			if diff := cmp.Diff(tc.wantDeleted, deleted); diff != "" {
+				t.Errorf("deleted mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// utilpodListToObjects converts a slice of Pods to a slice of client.Object.
+func utilpodListToObjects(pods []corev1.Pod) []client.Object {
+	objs := make([]client.Object, len(pods))
+	for i := range pods {
+		objs[i] = &pods[i]
+	}
+	return objs
+}

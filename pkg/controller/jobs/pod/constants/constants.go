@@ -31,6 +31,8 @@ const (
 	GroupFastAdmissionAnnotationValue = "true"
 	GroupServingAnnotationKey         = "kueue.x-k8s.io/pod-group-serving"
 	GroupServingAnnotationValue       = "true"
+	GroupKeepGatedWhileQueuedAnnotationKey   = "kueue.x-k8s.io/pod-group-keep-gated-while-queued"
+	GroupKeepGatedWhileQueuedAnnotationValue = "true"
 	RoleHashAnnotation                = "kueue.x-k8s.io/role-hash"
 	RetriableInGroupAnnotationKey     = "kueue.x-k8s.io/retriable-in-group"
 	RetriableInGroupAnnotationValue   = "false"

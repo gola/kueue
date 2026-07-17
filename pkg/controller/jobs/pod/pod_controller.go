@@ -61,6 +61,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	utilslices "sigs.k8s.io/kueue/pkg/util/slices"
 	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
+	"sigs.k8s.io/kueue/pkg/workload"
 )
 
 const (
@@ -240,6 +241,22 @@ func (p *Pod) isUnretriableGroup() bool {
 
 	p.unretriableGroup = new(false)
 	return false
+}
+
+// KeepGatedWhileQueued reports whether this pod group should keep its pods gated
+// while the associated Workload is not admitted, instead of stopping (deleting) them.
+// This is determined by the presence of the GroupKeepGatedWhileQueuedAnnotationKey
+// annotation and at least one pod in the group being gated.
+func (p *Pod) KeepGatedWhileQueued() bool {
+	if !p.isGroup {
+		return false
+	}
+	if p.pod.Annotations[podconstants.GroupKeepGatedWhileQueuedAnnotationKey] != podconstants.GroupKeepGatedWhileQueuedAnnotationValue {
+		return false
+	}
+	return slices.ContainsFunc(p.list.Items, func(pod corev1.Pod) bool {
+		return isGated(&pod)
+	})
 }
 
 // IsSuspended returns whether the job is suspended or not.
@@ -509,7 +526,18 @@ func (p *Pod) Stop(ctx context.Context, c client.Client, _ []podset.PodSetInfo, 
 	stoppedNow := make([]client.Object, 0)
 	for i := range podsInGroup {
 		// If the workload is being deleted, delete even finished Pods.
-		if !podsInGroup[i].DeletionTimestamp.IsZero() || (stopReason != jobframework.StopReasonWorkloadDeleted && podSuspended(&podsInGroup[i])) {
+		skipPod := !podsInGroup[i].DeletionTimestamp.IsZero()
+		if !skipPod && stopReason != jobframework.StopReasonWorkloadDeleted && podSuspended(&podsInGroup[i]) {
+			// A suspended (gated or terminated) pod is normally skipped for NotAdmitted/Evicted stops.
+			// But if this is a gated pod group and the stop reason is NotAdmitted,
+			// we should delete the gated pods unless keep-gated-while-queued is enabled.
+			if stopReason == jobframework.StopReasonNotAdmitted && p.isGroup && isGated(&podsInGroup[i]) && !p.KeepGatedWhileQueued() {
+				skipPod = false
+			} else {
+				skipPod = true
+			}
+		}
+		if skipPod {
 			continue
 		}
 		podInGroup := FromObject(&podsInGroup[i])
@@ -1274,6 +1302,15 @@ func (p *Pod) FindMatchingWorkloads(ctx context.Context, c client.Client, r even
 		return nil, []*kueue.Workload{workload}, nil
 	}
 
+	// If keep-gated-while-queued is enabled and the workload is not admitted,
+	// preserve excess gated pods instead of deleting them.
+	if p.shouldKeepGatedPodsForUnadmittedWorkload(workload, len(activePods), excessActivePods) {
+		if err := p.EnsureWorkloadOwnedByAllMembers(ctx, c, r, workload); err != nil {
+			return nil, nil, err
+		}
+		return nil, []*kueue.Workload{workload}, nil
+	}
+
 	// Do not clean up more pods until observing previous operations
 	if !p.satisfiedExcessPods {
 		return nil, nil, errPendingOps
@@ -1293,6 +1330,30 @@ func (p *Pod) FindMatchingWorkloads(ctx context.Context, c client.Client, r even
 		return nil, nil, err
 	}
 	return workload, []*kueue.Workload{}, nil
+}
+
+// shouldKeepGatedPodsForUnadmittedWorkload reports whether excess gated pods should be
+// preserved (not deleted) when the workload is not admitted and keep-gated-while-queued
+// is enabled. This is true when:
+// - There are excess active pods to clean up
+// - KeepGatedWhileQueued is enabled for this pod group
+// - The workload is not admitted
+// - The total active pod count does not exceed the declared group total count
+// - All excess active pods are gated
+func (p *Pod) shouldKeepGatedPodsForUnadmittedWorkload(wl *kueue.Workload, activePodCount int, excessActivePods []corev1.Pod) bool {
+	if len(excessActivePods) == 0 || !p.KeepGatedWhileQueued() || workload.IsAdmitted(wl) {
+		return false
+	}
+	totalCount, err := p.groupTotalCount()
+	if err != nil || activePodCount > totalCount {
+		return false
+	}
+	for i := range excessActivePods {
+		if !isGated(&excessActivePods[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Pod) countAbsentPods(ps kueue.PodSet, activePods int) int {
